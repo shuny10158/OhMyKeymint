@@ -1,0 +1,173 @@
+name: OMK SmallX TEERS ARM64 compatibility build V2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-arm64-module:
+    name: Build patched OMK ARM64 module
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout exact OMK 1.4.2 source
+        uses: actions/checkout@v4
+        with:
+          repository: ITxiao6666/OhMyKeymint
+          ref: 6921468757bfeb9334d100242eb0c472f91df8fa
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Verify original source and apply compatibility patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "065323c007f848190726ee204ea0813ff13767a13469f72bdc41bf2b539ed001  injector/src/hook/rewrite/reply.rs" | sha256sum --check -
+          cat > /tmp/omk-smallx-compat.patch <<'OMK_PATCH'
+          --- a/injector/src/hook/rewrite/reply.rs
+          +++ b/injector/src/hook/rewrite/reply.rs
+          @@ -395,7 +395,6 @@
+               tr: &binder_transaction_data,
+               pending: &PendingSecurityLevelCall,
+           ) -> anyhow::Result<Option<OutboundReply>> {
+          -    let (data, data_size, offsets, offsets_size) = transaction_parts(tr);
+               if let ParsedSecurityLevelRequest::CreateOperation { operation_parameters, .. } =
+                   &pending.request
+               {
+          @@ -405,13 +404,15 @@
+                       None,
+                       operation_allows_aad(operation_parameters),
+                   ) {
+          -            return malformed_system_success_reply(
+          -                data,
+          -                data_size,
+          -                offsets,
+          -                offsets_size,
+          -                "createOperation reply",
+          -                error,
+          +            // A System-routed reply can contain a vendor or third-party Binder
+          +            // handle rather than the local Binder target OMK knows how to parse.
+          +            // The observation step is non-authoritative: preserve the genuine
+          +            // reply instead of fabricating SYSTEM_ERROR.
+          +            warn!(
+          +                "event=route System createOperation carrier observation failed for uid={} pid={}: {:#}; preserving original reply",
+          +                pending.caller.uid,
+          +                pending.caller.pid,
+          +                error
+                       );
+                   }
+               }
+          OMK_PATCH
+          git apply --check /tmp/omk-smallx-compat.patch
+          git apply /tmp/omk-smallx-compat.patch
+          git diff --check
+          echo "Patch applied to the exact OMK 1.4.2 source."
+
+      - name: Set up Rust nightly for Android ARM64
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly
+          target: aarch64-linux-android
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK command-line tools
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Install NDK r30, build tools and native dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build gcc-multilib protobuf-compiler
+          sdkmanager --install "ndk;30.0.16248370" "build-tools;35.0.0" "cmake;4.1.2" --sdk_root="$ANDROID_SDK_ROOT"
+          cargo install bindgen-cli
+          test -f "$ANDROID_SDK_ROOT/ndk/30.0.16248370/build/cmake/android.toolchain.cmake"
+
+      - name: Build BoringSSL with Android ARM64 Rust bindings
+        shell: bash
+        run: |
+          set -euo pipefail
+          BORINGSSL_SRC="$RUNNER_TEMP/omk-boringssl-native"
+          git clone --depth=1 https://boringssl.googlesource.com/boringssl "$BORINGSSL_SRC"
+          NDK="$ANDROID_SDK_ROOT/ndk/30.0.16248370"
+          "$ANDROID_SDK_ROOT/cmake/4.1.2/bin/cmake" -S "$BORINGSSL_SRC" -B "$BORINGSSL_SRC/build" -GNinja \
+            -DRUST_BINDINGS=aarch64-linux-android \
+            "-DCMAKE_SYSROOT=$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/" \
+            "-DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake" \
+            -DCMAKE_C_FLAGS=-mno-outline-atomics \
+            -DCMAKE_CXX_FLAGS=-mno-outline-atomics \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26
+          "$ANDROID_SDK_ROOT/cmake/4.1.2/bin/cmake" --build "$BORINGSSL_SRC/build" --parallel 4
+          test -s "$BORINGSSL_SRC/build/libcrypto.a"
+          test -s "$BORINGSSL_SRC/build/libssl.a"
+          test -s "$BORINGSSL_SRC/build/rust/bssl-sys/librust_wrapper.a"
+          test -s "$BORINGSSL_SRC/build/rust/bssl-sys/wrapper_aarch64-linux-android.rs"
+
+      - name: Configure Rust cross compilation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/setup_cargo_config.py \
+            --force \
+            --ndk-root "$ANDROID_SDK_ROOT/ndk/30.0.16248370" \
+            --api-level 26 \
+            --host-tag linux-x86_64
+          cat >> .cargo/config.toml <<EOF
+
+          [patch.crates-io]
+          bssl-sys = { path = "$RUNNER_TEMP/omk-boringssl-native/rust/bssl-sys" }
+          EOF
+          python3 -m pip install toml
+
+      - name: Build pinned engineer bridge required by OMK packaging
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/build_engineer_bridge.py \
+            --target aarch64-linux-android \
+            --sdk "$ANDROID_SDK_ROOT" \
+            --ndk "$ANDROID_SDK_ROOT/ndk/30.0.16248370"
+          test -s target/engineer-bridge/aarch64-linux-android/native/libomk_engineer.so
+          test -d target/engineer-bridge/aarch64-linux-android/licenses
+
+      - name: Build ReSukiSU-compatible ARM64 module ZIP
+        shell: bash
+        env:
+          BORINGSSL_BUILD_DIR: ${{ runner.temp }}/omk-boringssl-native/build
+          CARGO_HUSKY_DONT_INSTALL_HOOKS: '1'
+        run: |
+          set -euo pipefail
+          unset RUSTFLAGS
+          python3 build.py --release --abi arm64-v8a
+          shopt -s nullglob
+          modules=(target/OhMyKeymint-*-release.zip)
+          test "${#modules[@]}" -eq 1
+          unzip -t "${modules[0]}" >/dev/null
+          unzip -l "${modules[0]}" | grep -F "libs/arm64-v8a/inject"
+          unzip -l "${modules[0]}" | grep -F "libs/arm64-v8a/keymint"
+          unzip -l "${modules[0]}" | grep -F "module.prop"
+          unzip -p "${modules[0]}" "libs/arm64-v8a/inject" >/tmp/omk-inject
+          file /tmp/omk-inject
+          file /tmp/omk-inject | grep -E "ELF 64-bit.*ARM aarch64"
+          sha256sum "${modules[0]}" | tee target/MODULE_SHA256.txt
+
+      - name: Upload test module and checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: OMK-SmallX-TEERS-ARM64-TEST
+          path: |
+            target/OhMyKeymint-*-release.zip
+            target/MODULE_SHA256.txt
+          retention-days: 14
+          if-no-files-found: error
